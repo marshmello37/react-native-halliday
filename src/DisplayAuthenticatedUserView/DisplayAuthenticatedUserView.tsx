@@ -14,7 +14,11 @@ import nacl_util from "tweetnacl-util";
 import { client } from "../client";
 import { Wallet } from "@dynamic-labs/client";
 import * as WebBrowser from "expo-web-browser";
-import { useQuote, Quote } from "../hooks/useQuote";
+import { useQuote, Quote, QuoteResponse } from "../hooks/useQuote";
+import {
+  useRecoverablePayments,
+  RecoverablePayment,
+} from "../hooks/useRecoverablePayments";
 
 export const DisplayAuthenticatedUserView: FC = () => {
   const { auth, wallets } = useReactiveClient(client);
@@ -26,6 +30,32 @@ export const DisplayAuthenticatedUserView: FC = () => {
   const [paymentStatus, setPaymentStatus] = useState<string | null>(null);
   const [isFunded, setIsFunded] = useState(false);
   const address = wallets.userWallets[0].address;
+
+  // Recovery
+  const recovery = useRecoverablePayments();
+  const [withdrawingKey, setWithdrawingKey] = useState<string | null>(null);
+  const [withdrawResult, setWithdrawResult] = useState<{
+    key: string;
+    txHash: string;
+  } | null>(null);
+  const [withdrawError, setWithdrawError] = useState<{
+    key: string;
+    message: string;
+  } | null>(null);
+  const [retryTarget, setRetryTarget] = useState<RecoverablePayment | null>(
+    null,
+  );
+  const [retryQuotes, setRetryQuotes] = useState<QuoteResponse | null>(null);
+  const [retryLoading, setRetryLoading] = useState(false);
+  const [retryError, setRetryError] = useState<string | null>(null);
+  const [selectedRetryQuote, setSelectedRetryQuote] = useState<Quote | null>(
+    null,
+  );
+  const [retryConfirming, setRetryConfirming] = useState(false);
+  const [retryPaymentStatus, setRetryPaymentStatus] = useState<string | null>(
+    null,
+  );
+  const retryPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const paymentIdRef = useRef<string | null>(null);
@@ -82,6 +112,7 @@ export const DisplayAuthenticatedUserView: FC = () => {
     return () => {
       sub.remove();
       stopPolling();
+      if (retryPollingRef.current) clearInterval(retryPollingRef.current);
     };
   }, [fetchPaymentStatus, stopPolling]);
 
@@ -155,6 +186,124 @@ export const DisplayAuthenticatedUserView: FC = () => {
     const messageBytes = nacl_util.decodeUTF8(message);
     const signer = client.solana.getSigner({ wallet });
     await signer.signMessage(messageBytes);
+  };
+
+  const signTypedData = async (withdrawAuthorization: string) => {
+    const { domain, types, primaryType, message } = JSON.parse(
+      withdrawAuthorization,
+    );
+    delete types.EIP712Domain;
+    const wallet = wallets.userWallets[0];
+    const walletClient = await client.viem.createWalletClient({ wallet });
+    return walletClient.signTypedData({ domain, types, primaryType, message });
+  };
+
+  const handleWithdraw = async (payment: RecoverablePayment) => {
+    const key = `${payment.paymentId}-${payment.token}`;
+    setWithdrawingKey(key);
+    setWithdrawResult(null);
+    setWithdrawError(null);
+    try {
+      const typedData = await recovery.getWithdrawTypedData(
+        payment.paymentId,
+        payment.token,
+        payment.amount,
+        address,
+      );
+      const signature = await signTypedData(typedData.withdraw_authorization);
+      const txHash = await recovery.submitWithdraw(
+        payment.paymentId,
+        payment.token,
+        payment.amount,
+        address,
+        signature,
+      );
+      setWithdrawResult({ key, txHash });
+    } catch (e: any) {
+      setWithdrawError({ key, message: e.message });
+    } finally {
+      setWithdrawingKey(null);
+    }
+  };
+
+  const handleRetry = async (payment: RecoverablePayment) => {
+    setRetryTarget(payment);
+    setRetryQuotes(null);
+    setRetryError(null);
+    setSelectedRetryQuote(null);
+    setRetryConfirming(false);
+    setRetryPaymentStatus(null);
+    setRetryLoading(true);
+    if (retryPollingRef.current) {
+      clearInterval(retryPollingRef.current);
+      retryPollingRef.current = null;
+    }
+    try {
+      const quotes = await recovery.fetchRetryQuotes(
+        payment.paymentId,
+        payment.token,
+        payment.amount,
+        payment.outputAsset,
+      );
+      if (!quotes.quotes?.length) {
+        throw new Error("No retry quotes available. Try withdrawal instead.");
+      }
+      setRetryQuotes(quotes);
+    } catch (e: any) {
+      setRetryError(e.message);
+    } finally {
+      setRetryLoading(false);
+    }
+  };
+
+  const handleConfirmRetry = async () => {
+    if (!retryTarget || !selectedRetryQuote || !retryQuotes) return;
+    setRetryConfirming(true);
+    setRetryError(null);
+    try {
+      const confirmData = await recovery.confirmRetryPayment(
+        selectedRetryQuote.payment_id,
+        retryQuotes.state_token,
+        address,
+      );
+      const depositAddress =
+        confirmData.next_instruction.deposit_info[0].deposit_address;
+      const newPaymentId = confirmData.payment_id;
+
+      const typedData = await recovery.getWithdrawTypedData(
+        retryTarget.paymentId,
+        retryTarget.token,
+        retryTarget.amount,
+        depositAddress,
+      );
+      const signature = await signTypedData(typedData.withdraw_authorization);
+      await recovery.submitWithdraw(
+        retryTarget.paymentId,
+        retryTarget.token,
+        retryTarget.amount,
+        depositAddress,
+        signature,
+      );
+
+      setRetryPaymentStatus("PROCESSING");
+      retryPollingRef.current = setInterval(async () => {
+        try {
+          const status = await recovery.fetchPaymentStatus(newPaymentId);
+          setRetryPaymentStatus(status.status);
+          if (status.status === "COMPLETE") {
+            if (retryPollingRef.current)
+              clearInterval(retryPollingRef.current);
+            retryPollingRef.current = null;
+          }
+        } catch {
+          // ignore polling errors
+        }
+      }, 3000);
+    } catch (e: any) {
+      setRetryError(e.message);
+    } finally {
+      setRetryConfirming(false);
+    }
   };
 
   return (
@@ -316,6 +465,152 @@ export const DisplayAuthenticatedUserView: FC = () => {
                 </Text>
               </View>
             )}
+          </View>
+        </View>
+      )}
+
+      <View style={styles.section}>
+        <Text style={styles.section__heading}>Payment Recovery:</Text>
+        <View style={[styles.content_section, styles.actions_section]}>
+          <Button
+            onPress={() => recovery.loadPayments(address)}
+            title="Load Recoverable Payments"
+            disabled={recovery.loading}
+          />
+          {recovery.loading && (
+            <View style={styles.skeleton_container}>
+              <ActivityIndicator size="large" />
+              <Text style={styles.skeleton_text}>Loading payments...</Text>
+            </View>
+          )}
+          {recovery.error && (
+            <View style={styles.error_container}>
+              <Text style={styles.error_text}>{recovery.error}</Text>
+            </View>
+          )}
+          {recovery.payments.map((p) => {
+            const key = `${p.paymentId}-${p.token}`;
+            const isWithdrawing = withdrawingKey === key;
+            return (
+              <View key={key} style={styles.wallet_item}>
+                <Text>Payment: {p.paymentId}</Text>
+                <Text>Status: {p.status}</Text>
+                <Text>Token: {p.token}</Text>
+                <Text>Amount: {p.amount}</Text>
+                <Text>Created: {p.createdAt}</Text>
+                <View style={styles.button_group}>
+                  <Button
+                    title="Retry"
+                    onPress={() => handleRetry(p)}
+                    disabled={isWithdrawing || retryConfirming}
+                  />
+                  <Button
+                    title={isWithdrawing ? "Withdrawing..." : "Withdraw"}
+                    onPress={() => handleWithdraw(p)}
+                    disabled={isWithdrawing || retryConfirming}
+                  />
+                </View>
+                {withdrawResult?.key === key && (
+                  <Text>Withdraw TX: {withdrawResult.txHash}</Text>
+                )}
+                {withdrawError?.key === key && (
+                  <View style={styles.error_container}>
+                    <Text style={styles.error_text}>
+                      {withdrawError.message}
+                    </Text>
+                  </View>
+                )}
+              </View>
+            );
+          })}
+        </View>
+      </View>
+
+      {retryTarget && (
+        <View style={styles.section}>
+          <Text style={styles.section__heading}>
+            Retry: {retryTarget.paymentId}
+          </Text>
+          <View style={[styles.content_section, styles.actions_section]}>
+            <Text>
+              {retryTarget.amount} {retryTarget.token} →{" "}
+              {retryTarget.outputAsset}
+            </Text>
+            {retryLoading && !retryQuotes && (
+              <View style={styles.skeleton_container}>
+                <ActivityIndicator size="large" />
+                <Text style={styles.skeleton_text}>
+                  Loading retry quotes...
+                </Text>
+              </View>
+            )}
+            {retryError && (
+              <View style={styles.error_container}>
+                <Text style={styles.error_text}>{retryError}</Text>
+              </View>
+            )}
+            {retryQuotes?.quotes.map((q: Quote) => {
+              const isSelected =
+                selectedRetryQuote?.payment_id === q.payment_id;
+              return (
+                <Pressable
+                  key={q.payment_id}
+                  onPress={() =>
+                    setSelectedRetryQuote(isSelected ? null : q)
+                  }
+                >
+                  <View
+                    style={[
+                      styles.quote_card,
+                      isSelected && styles.quote_card_selected,
+                    ]}
+                  >
+                    <View style={styles.quote_header}>
+                      <Text style={styles.quote_method}>
+                        {q.onramp_method?.replace(/_/g, " ") || "Route"}
+                      </Text>
+                      <Text style={styles.quote_amount}>
+                        {parseFloat(q.output_amount.amount).toFixed(2)} output
+                      </Text>
+                    </View>
+                    <Text style={styles.quote_fees}>
+                      Fees: ${parseFloat(q.fees.total_fees).toFixed(2)}{" "}
+                      {q.fees.currency_symbol.toUpperCase()}
+                    </Text>
+                  </View>
+                </Pressable>
+              );
+            })}
+            {selectedRetryQuote && (
+              <Button
+                title={retryConfirming ? "Processing Retry..." : "Confirm Retry"}
+                onPress={handleConfirmRetry}
+                disabled={retryConfirming}
+              />
+            )}
+            {retryConfirming && <ActivityIndicator size="small" />}
+            {retryPaymentStatus && (
+              <View
+                style={[
+                  styles.status_badge,
+                  retryPaymentStatus === "COMPLETE" && styles.status_funded,
+                ]}
+              >
+                <Text style={styles.status_text}>
+                  Retry Status: {retryPaymentStatus}
+                </Text>
+              </View>
+            )}
+            <Button
+              title="Cancel"
+              onPress={() => {
+                setRetryTarget(null);
+                if (retryPollingRef.current) {
+                  clearInterval(retryPollingRef.current);
+                  retryPollingRef.current = null;
+                }
+              }}
+            />
           </View>
         </View>
       )}
